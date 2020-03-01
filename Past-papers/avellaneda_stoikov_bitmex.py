@@ -1,16 +1,3 @@
-Skip to content
- 
-Search…
-All gists
-Back to GitHub
-@LongntLe 
-@LongntLe LongntLe/main.py Secret
-Created 3 months ago
-0
- Code Revisions 1
-<script src="https://gist.github.com/LongntLe/dbc169020c9d5eda138000e72e6ba01d.js"></script>
-  
- main.py
 from __future__ import absolute_import
 from time import sleep
 import sys
@@ -886,20 +873,3 @@ if __name__ == "__main__":
     os.environ['TZ'] = 'Asia/Saigon'
     time.tzset() # only available in Unix
 run()
-@LongntLe
- 
-Leave a comment
-
-Attach files by dragging & dropping, selecting or pasting them.
-© 2020 GitHub, Inc.
-Terms
-Privacy
-Security
-Status
-Help
-Contact GitHub
-Pricing
-API
-Training
-Blog
-About
