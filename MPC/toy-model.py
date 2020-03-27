@@ -67,10 +67,15 @@ act_s = ob_df.ms.tolist()[1:201] # data moves up 1 step to account for latency.
 ord_list = [0]*15 + ord_list
 ds = np.array(act_s[1:]) - np.array(act_s[:-1])
 pnl = np.cumsum(np.cumsum(np.array(ord_list[:-1]))*ds)
+
+fig = plt.figure(figsize=(15,5))
+plt.subplot(1,3,1)
 plt.plot(pnl)
 
 # plot inventory over time
+plt.subplot(1,3,2)
 plt.plot(np.cumsum(ord_list))
 
 # plot price time series
+plt.subplot(1,3,3)
 plt.plot(act_s)
