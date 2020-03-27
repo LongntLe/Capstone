@@ -18,18 +18,19 @@ import math as math_lib
 import threading
 import numpy as np
 from decimal import *
-import pandas as pd 
+import pandas as pd
 import ccxt
 
 # Chosing the correct settings file based on the parameter
 if len(sys.argv) == 1:
-    settings = SettingsDict.OPTIONS['ETHUSD']
+    settings = SettingsDict.OPTIONS['XBTUSD']
 else:
     settings = SettingsDict.OPTIONS[str(sys.argv[1])]
+    logger = log.setup_custom_logger(str(sys.argv[1]))
 
 
 # Used symbols
-SYMBOLS = ('ETHUSD', 'XBTUSD')
+SYMBOLS = ['XBTUSD', 'ETHUSD']
 
 print(settings)
 
@@ -43,17 +44,22 @@ watched_files_mtimes = [(f, getmtime(f)) for f in settings.WATCHED_FILES]
 #
 # Helpers
 #
-logger = log.setup_custom_logger('root')
 
 GAMMA = settings.GAMMA
 K = settings.K
 D = settings.D
 THETA = settings.THETA
+T = settings.T
 ETA = settings.ETA
 ETA2 = settings.ETA2
 MAX_POS = settings.MAX_POS
-THRESHOLD = THETA*2.5
+THRESHOLD = settings.THRESHOLD
+SAD_THRESHOLD = settings.SAD_THRESHOLD
+REG_COEF = settings.REG_COEF
+PERC = settings.PERC
+MIN_VOLA = settings.MIN_VOLA
 OF_LIMIT = 500000 # TODO: add this to settings
+
 
 class ExchangeInterface:
     def __init__(self, dry_run=False):
@@ -69,7 +75,7 @@ class ExchangeInterface:
 
     def cancel_order(self, order):
         tickLog = self.get_instrument()['tickLog']
-        logger.info("Canceling: %s %d @ %.*f" % (order['side'], order['orderQty'], tickLog, order['price']))
+        logger.info("Canceling: %s %s %d @ %.*f" % (order['orderID'], order['side'], order['orderQty'], tickLog, order['price']))
         while True:
             try:
                 self.bitmex.cancel(order['orderID'])
@@ -92,12 +98,15 @@ class ExchangeInterface:
         orders = self.bitmex.http_open_orders()
 
         for order in orders:
-            logger.info("Canceling: %s %d @ %.*f" % (order['side'], order['orderQty'], tickLog, order['price']))
+            logger.info("Canceling: %s %s %d @ %.*f" % (order['orderID'], order['side'], order['orderQty'], tickLog, order['price']))
 
         if len(orders):
             self.bitmex.cancel([order['orderID'] for order in orders])
 
         sleep(settings.API_REST_INTERVAL)
+        
+    def get_balance(self):
+        return self.bitmex.funds()
 
     def get_portfolio(self):
         contracts = settings.CONTRACTS
@@ -159,9 +168,9 @@ class ExchangeInterface:
         # if symbol == "XBTUSD":
         #     total_contracts = self.get_position(symbol)['currentQty']
         # else:
-        for symbol in SYMBOLS:
-            total_contracts += self.get_position(symbol)['currentQty']
-        print('Total Contracts: {}'.format(total_contracts))
+        #for symbol in SYMBOLS:
+        total_contracts += self.get_position(symbol)['currentQty']
+        #print('Total Contracts: {}'.format(total_contracts))
 
         return total_contracts
 
@@ -252,58 +261,56 @@ class OrderManager:
 
         self.start_time = datetime.datetime.now()
         self.instrument = self.exchange.get_instrument()
-        self.starting_qty = self.exchange.get_delta(self.exchange.symbol)
-        self.running_qty = None
+        #self.starting_qty = self.exchange.get_delta(self.exchange.symbol) # to be used in print_status, which ceases to be used this patch 
+        #self.running_qty = None # to be used in print_status, which ceases to be used this patch
 
-        self.cur_volatility = None
-        self.act_volatility = None
-        self.cur_qty = None
-        self.prev_qty = None
-        self.streak = 0
-        self.prev_len = 0
-        self.cur_len = 0
-        self.idle = 0
-        self.first = True
-        self.sleep_ctr = 0
+        self.cur_qty = None # current quantity
+        self.prev_qty = None # previous quantity
+
         self.general_ctr = 0
-        self.ctr = 0
-        self.to_record_vola = True
-        self.vola_adjust = 1.
-        self.slope_ctr = 0
-        self.plus = True
 
+        self.ctr = 0
+
+        self.cur_ret = 0
+        self.post_order = False
+        self.volatility, self.prev_volatility = None, None
+        self.react = 0 # against fast, sudden moves in price
+
+        self.hold_ctr = 0
+
+        
+        # collect data with ccxt
         exchange = ccxt.bitmex()
-        logger.info('Connected to CCXT')
         date_N_days_ago = (datetime.datetime.now() - datetime.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S")
         since = time.mktime(datetime.datetime.strptime(date_N_days_ago, "%Y-%m-%d %H:%M:%S").timetuple())*1000
         if self.exchange.symbol == "ETHUSD":
             df = exchange.fetch_ohlcv('ETH/USD', timeframe = '1m', since=since, limit=500)
-            print ('---'*20)
-            print ('CONNECT TO CCXT ETHUSD')
-            print ('---'*20)
+            logger.debug ('---'*20)
+            logger.debug ('CONNECT TO CCXT ETHUSD')
+            logger.debug ('---'*20)
         elif self.exchange.symbol == "XBTUSD":
             df = exchange.fetch_ohlcv('BTC/USD', timeframe = '1m', since=since, limit=500)
-            print ('---'*20)
-            print ('CONNECT TO CCXT XBTUSD')
-            print ('---'*20)
+            logger.debug ('---'*20)
+            logger.debug ('CONNECT TO CCXT XBTUSD')
+            logger.debug ('---'*20)
         df = pd.DataFrame(df)
         df.columns = ["Timestamp", "Open", "High", "Low", "tick", "Volume"]
 
+        # setup database
         self.client = InfluxDBClient(host='localhost', port=8086)
         self.client.switch_database('example')
 
         self.df = pd.DataFrame({'tick': df.tick.values.tolist()})
-        logger.info('Retrieved data from CCXT! Len df: {}'.format(len(self.df)))
-
-        self.of = None
+        logger.info('Symbol: {} Retrieved data from CCXT! Len df: {}'.format(self.exchange.symbol, len(self.df)))
 
         self.reset()
 
     def reset(self):
         self.exchange.cancel_all_orders()
+        logger.info ('Reset finished. Start sanity check.')
         self.sanity_check()
-        self.print_status()
-
+        #self.print_status()
+        logger.info('sanity check finished')
         # Create orders and converge.
         self.one_loop()
 
@@ -333,65 +340,25 @@ class OrderManager:
         # Midpoint, used for simpler order placement.
         self.start_position_mid = ticker["mid"]
         #print (self.start_position_mid)
-        logger.info("%s Ticker: New Mid %f" % (self.instrument['symbol'], self.start_position_mid))
+        logger.debug("%s Ticker: New Mid %f" % (self.instrument['symbol'], self.start_position_mid))
         return ticker
 
     def calc_res_price(self, mid, qty, vola, max_pos=MAX_POS):
         #print (qty) 
-        VAR = max(vola, 0.0005)
-        logger.info('Qty: {}, GAMMA: {}, VAR: {}, D: {}'.format(qty, GAMMA, VAR, D))
-        r = mid - (qty*GAMMA*VAR*D)/MAX_POS
-        #if abs(self.slope_ctr) >= 6:
-        #    if self.exchange.symbol == "ETHUSD":
-        #        r += 0.05*self.slope_ctr
-        #    elif self.exchange.symbol == "XBTUSD":
-        #        r += 0.5*self.slope_ctr
-        # if self.exchange.symbol == "ETHUSD":
-        #     r -= np.sign(qty)*(abs(qty)/THRESHOLD)*0.05*10 #0.05: min tick; 10: arbitrary constant.
-        spread = max(0.1, GAMMA*VAR*D + np.log10(1+GAMMA/K))
+        if self.exchange.symbol == "ETHUSD":
+            VAR = max(vola, MIN_VOLA)
+        elif self.exchange.symbol == "XBTUSD":
+            VAR = max(vola, MIN_VOLA)
+        logger.debug('Qty: {}, GAMMA: {}, VAR: {}, Time to pos close: {}'.format(qty, GAMMA, VAR, (1-self.hold_ctr/D)))
+        r = mid - (qty*GAMMA*VAR*(1+self.hold_ctr/D))/max_pos + self.react * T * self.cur_ret
+        spread = GAMMA*VAR*(1-self.hold_ctr/D) + np.log10(1+GAMMA/K)
         return r, spread
 
     def get_qty(self, qty, vola):
         #buy_qty = THETA*np.exp(-ETA2*qty) if qty < 0 else THETA*np.exp(-ETA*qty)
         #sell_qty = THETA*np.exp(ETA2*qty) if qty > 0 else THETA*np.exp(ETA*qty)
-        single_qty = self.single_qty
-        if vola >  0.8:
-            self.vola_adjust = 0
-        elif abs(qty) > 250 or abs(single_qty) > 250:
-            self.vola_adjust = 0.25
-        elif vola > 0.025 or abs(qty) >= 150 or abs(single_qty) >= 150:
-            self.vola_adjust = 0.5
-        else:
-            self.vola_adjust = 1.
-
-        if qty > 0: 
-            buy_qty = THETA if qty < THETA*5 else 0
-            sell_qty = THETA if qty < THETA*4 else THETA*2
-            buy_qty = buy_qty*self.vola_adjust
-            if abs(single_qty) <= THETA/2:
-                sell_qty += abs(single_qty)
-
-        else:
-            buy_qty = THETA if -qty < THETA*4 else THETA*2
-            sell_qty = THETA if -qty < THETA*5 else 0
-            sell_qty = sell_qty*self.vola_adjust
-            if qty == 0:
-                buy_qty = buy_qty*self.vola_adjust
-            if abs(single_qty) <= THETA/2:
-                buy_qty += abs(single_qty)
-
-        # if qty < 0:
-        #     if (abs(qty)/THETA) < 1.5:
-        #         buy_qty = abs(qty)
-        #     else:
-        #         buy_qty = THETA*np.exp(-ETA2*qty)
-        #     sell_qty = THETA*np.exp(ETA*qty)
-        # else:
-        #     if (abs(qty)/THETA) < 1.5:
-        #         sell_qty = -qty
-        #     else:
-        #         sell_qty = THETA*np.exp(ETA2*qty)
-        #     buy_qty = THETA*np.exp(-ETA*qty)
+        buy_qty = THETA
+        sell_qty = THETA
         return int(round(buy_qty)), int(round(sell_qty))
 
     def truncate(self, number, digits) -> float:
@@ -407,9 +374,9 @@ class OrderManager:
             bid_orders = list(rs.get_points(tags={'side':'sell', 'pair':str(self.exchange.symbol)}))
             of = sum([bid_orders[i]['amount'] for i in range(len(bid_orders))]) - sum([ask_orders[i]['amount'] for i in range(len(ask_orders))])
 
-            print ("="*10)
-            print ('Of of {0} = {1}'.format(str(self.exchange.symbol), of))
-            print ("="*10)
+#             print ("="*10)
+#             print ('Of of {0} = {1}'.format(str(self.exchange.symbol), of))
+#             print ("="*10)
             self.add_to_influx("order_imbalance"+"+"+str(self.exchange.symbol), float(of))
         except Exception as e:
             print(e)
@@ -432,183 +399,94 @@ class OrderManager:
             return min(40, of/(2*OF_LIMIT))
         if self.exchange.symbol == "ETHUSD":
             return min(4, of/OF_LIMIT)
+          
+    def determine_vola_level(self, cur_vola):
+        return 1
+        if cur_vola >= 0.020:
+            return 4
+        elif cur_vola >= 0.014 or cur_vola <= MIN_VOLA:
+            return 3
+        elif cur_vola >= 0.010:
+            return 2
+        else:
+            return 1
 
     def one_loop(self):
+        start = time.time()
         #self.ctr += 1
+        logger.info("==="*10)
         self.general_ctr += 1
         ticker = self.get_ticker()
         pos = self.exchange.get_delta(self.exchange.symbol)
         ord_list = self.exchange.get_orders()
         self.cur_qty = self.exchange.get_delta(self.exchange.symbol)
-        self.single_qty = self.exchange.get_position(self.exchange.symbol)['currentQty']
-        self.cur_of = self.get_order_imbalance()
+        self.single_qty = pos#self.exchange.get_position(self.exchange.symbol)['currentQty']
+        self.react -= 1 if self.react >= 1 else 0
+        buy_ords = []
+        sell_ords = []
+        for i in ord_list:
+            if i['side'] == 'Buy':
+                buy_ords.append(i)
+            if i['side'] == 'Sell':
+                sell_ords.append(i)
+        logger.info ('Recorded mid: {}'.format(ticker['mid']))
+        logger.info ('Current balance: {}'.format(self.exchange.get_balance()['amount']))
+        logger.info ('Current pos: {}'.format(pos))
+        for buy_ord in buy_ords:
+            logger.info ('Buy Orders: {} @{}'.format(buy_ord['orderQty'], buy_ord['price']))
+        for sell_ord in sell_ords:
+            logger.info ('Sell Orders: {} @{}'.format(sell_ord['orderQty'], sell_ord['price']))
+        position = self.exchange.get_position()
 
-        if self.first == True and pos != 0:
-            self.first = False
-            self.ctr = 1
-        if self.first == True and len(ord_list) != 0:
-            self.first = False
-            self.ctr = 1
 
-        if self.first:
-            self.offload_influx()
-            logger.info('Offload Influx -- On start.')
+        self.df = self.df.append(pd.DataFrame({'tick': [ticker['mid']]}), ignore_index = True, sort=True)
+        if len(self.df) > 120:
+            self.df = self.df.iloc[-120:]
+            self.df['ret'] = ((self.df['tick'] - self.df['tick'].shift())/self.df['tick'].shift())*100
 
-        if self.ctr == 1:
-            self.ctr = 0
-            self.df = self.df.append(pd.DataFrame({'tick': [ticker['mid']]}), ignore_index = True)
-            if len(self.df) > 40:
-                # self.write = True
-                self.df = self.df.iloc[-120:]
-                self.df['ret'] = ((self.df['tick'] - self.df['tick'].shift())/self.df['tick'].shift())*100
-                self.df['mean'] = self.df['ret'].rolling(36).apply(np.mean)
-                self.df['ma10'] = self.df['tick'].rolling(5).apply(np.mean)
-                #print (((self.df['ret'] - self.df['mean'])**2).rolling(36).apply(np.mean))
-                self.df['vola'] = ((self.df['ret'] - self.df['mean'])**2).rolling(36).apply(np.mean)
-                self.df['vola'] = self.df['vola'].apply(np.sqrt)
+            self.volatility = np.std(self.df['ret'].tolist()[1:])
 
-                # self.df.loc[self.df.ma10.shift(1) - self.df.ma10 > 0, 'slope'] = -1
-                # self.df.loc[self.df.ma10 - self.df.ma10.shift(1) > 0, 'slope'] = 1
-                # self.df.loc[self.df.slope.shift(-1) == -1, 'slope'] = -1
-                # self.df.loc[self.df.slope.shift(-1) == 1, 'slope'] = 1
-                # self.df.loc[self.df.ma10.shift(1) - self.df.ma10 == 0, 'slope'] = 0
-                # self.df.loc[self.df.slope.shift(-1) == 0, 'slope'] = 0
+            self.cur_ret = self.df.ret.tolist()[-1]
+            if self.prev_volatility is not None:
+                if abs(self.cur_ret) >= self.prev_volatility:
+                    self.react = 1
+                    self.post_order = True
 
-                self.cur_volatility = self.df.iloc[-1].vola
-                print ("Volatility: ", self.cur_volatility)
-                self.slope_ctr += np.sign(self.df.ma10.tolist()[-1] - self.df.ma10.tolist()[-2]) if self.df.ma10.tolist()[-1] != self.df.ma10.tolist()[-2] else -0.5*np.sign(self.slope_ctr)
-                print ('*'*10)
-                print ('Symbol - {}, Current Slope -  {}'.format(self.exchange.symbol, self.slope_ctr))
-                print ('*'*10)
-                logger.info('Five secs -- Volatility: {}, Trade Volatility: {}, Order Imbalance: {}'.format(self.cur_volatility, self.act_volatility, self.cur_of))
-            if self.first:
-                print (self.df.tail(5))
-                print (self.df.iloc[-1], self.df.iloc[-1].tick, self.df.iloc[-2], self.df.iloc[-2].tick)
-            if self.to_record_vola:
-                self.act_volatility = self.cur_volatility
-                self.to_record_vola = False
+        if self.prev_volatility is None and self.volatility is not None:
+            self.post_order = True
+                                 
 
         if len(ord_list) > 2:
             self.exchange.cancel_all_orders()
-
-        if self.general_ctr == 180:
-            logger.info('RAN FOR 15 mins. Clean database')
-            self.general_ctr = 0
-            self.offload_influx()
-
-        if abs(self.slope_ctr) >= 6 and self.plus == True:
-            self.slope_ctr += np.sign(self.slope_ctr)*8
-            self.plus = False
-        if abs(self.slope_ctr) <= 1:
-            self.plus = True
-
-        # if (self.df.iloc[-1].tick == self.df.iloc[-2].tick) and (self.df.iloc[-3].tick == self.df.iloc[-2].tick):
-        #     print ('Repetition! RESTART TRIGGERING: ', [self.df.iloc[-1].tick, self.df.iloc[-2].tick, self.df.iloc[-3].tick])
-        #     logger.info('Repetition! RESTART TRIGGERING')
-        #     self.restart()
-
-        # no need for automatic restart for now
-        # if self.general_ctr == 2880:
-        #     print ('RAN FOR 12 HRS! RESTART TRIGGERING')
-        #     logging.info('RAN FOR 12 HRS! RESTART TRIGGERING')
-        #     self.general_ctr = 0
-        #     self.restart()
-
-        self.cur_len = len(ord_list)
-        if (self.cur_len == self.prev_len) and (self.cur_len > 0): # could incur errors
-            self.idle += 1
-        elif (self.cur_len < self.prev_len):
-            print ("RAPID FILLED: ", self.cur_len, self.prev_len)
-            self.streak += 1
-            self.idle = 0 #wont use idle for now
-        else:
-            self.idle = 0
-
-        print ('==='*10)
-
-        print ("{}: {}".format(self.exchange.symbol, self.cur_volatility))
-        print ('==='*10)
-        logger.debug('Subminute -- Mid price {}; Position Size: {}; OrderList: {}; OrderLength: {}'.format(ticker['mid'], pos, ord_list, len(ord_list)))
-        #logger.info("Current Order list: ", ord_list, self.cur_len)
-
-        if self.act_volatility != None: #abrupt change in volatility
-        # AND MID NOT NEARBY LIMIT ORDER PRICE
-            cond1 = self.cur_volatility > self.act_volatility*1.25
-            cond2 = self.cur_volatility < self.act_volatility*.75
-        else:
-            cond1 = cond2 = False
-
-        cond3 = (self.cur_volatility != None) and (self.first) # no order placed before + enough data to calc volatility
-        cond4 = (ord_list != None) and (ord_list != []) and (len(ord_list) < 2) #and (self.cur_len < self.prev_len) # 1 order just filled --> left 1 order on the other side
-        #cond5 = (self.idle == 60) # if orders don't get filled for too long
-        cond5 = False
-        cond6 = (ord_list == [] and self.first == False) # no orders after the first trade
-        cond7 = (ord_list != None) and (ord_list != []) and (len(ord_list) < 2) and (ord_list[0]['side'] == 'Buy') and (pos != 0) and (pos > 0) # 1 order left + on the same side of the pos
-        cond8 = (ord_list != None) and (ord_list != []) and (len(ord_list) < 2) and (ord_list[0]['side'] == 'Sell') and (pos != 0) and (pos < 0) # 1 order left + on the same side of the pos
-        cond9 = (len(ord_list) >= 10)
-
-        cond10 = False
-        cond11 = self.prev_qty != None and self.cur_qty != self.prev_qty
-
-        if self.of != None and self.cur_of != None and self.of != 0 and self.cur_of != 0:
-            cond10 = ((self.cur_of - self.of) >= 30000) and (max(self.cur_of, self.of)/ min(self.cur_of, self.of) >= 1.2)
-        elif abs(self.cur_of > 0) and self.of == 0:
-            cond10 = True
-
-        if self.streak == 3:
-            logger.debug('Sleep to prevent successive market orders.') ## TODO: not working correctly
-            cond4 = False
-            self.streak = 0
-            self.sleep_ctr += 1
-
-        if abs(self.slope_ctr) >= 6 and np.sign(pos) != np.sign(self.slope_ctr):
-            cond1 = False
-            cond2 = False
-            cond3 = False
-            cond4 = False
-            cond5 = False
-            cond6 = False
-            cond7 = False
-            cond8 = False
-            cond9 = False
-            cond10 = False
-            logger.info('Caught in Trend. Stop Trading!')
-        if abs(self.slope_ctr) >= 6 and np.sign(pos) == np.sign(self.slope_ctr):
-            if (abs(self.slope_ctr) % 2 == 0) or ((abs(self.slope_ctr) - 0.5) % 2 == 0):
-                logger.info('Intermittently checking on inventory.')
-                cond4 = True
-
-        logger.debug('assess conditions: {}, {}, {}, {}, {}, {}, {}, {}, {}, {}'.format(cond1, cond2, cond3, cond4, cond5, cond6, cond7, cond8, cond9, cond10))
-        if cond1 or cond2 or cond3 or cond4 or cond5 or cond6 or cond7 or cond8 or cond9 or cond10 or cond11:
-            if cond3:
-                logger.info('First Trade!')
-                self.first = False
-            if cond4 or cond1 or cond2 or cond7 or cond8 or cond9 or cond10 or cond11: # TODO: case work to specify which factor influences the revise
-                logger.info('Revise')
-                #self.client.Order.Order_cancelAll().result()
-            if cond5:
-                logger.info('Idle')
-                self.idle = 0
-            r, spread = self.calc_res_price(ticker["mid"], pos, self.cur_volatility)
-            other_r, other_spread = self.calc_res_price(ticker["mid"], self.single_qty, self.cur_volatility, MAX_POS*5)
-            print ('Real mid: ', r)
-            print ('Spread: ', spread)
-            buy_qty, sell_qty = self.get_qty(pos, self.cur_volatility)
-            other_buy_qty, other_sell_qty = self.get_qty(self.single_qty, self.cur_volatility)
-            buy_qty = max(buy_qty, other_buy_qty)
-            sell_qty = max(sell_qty, other_sell_qty)
+        if self.prev_qty != 0 and self.cur_qty != 0 and self.prev_qty == self.cur_qty:
+            self.hold_ctr += 1
+        if self.hold_ctr != 0 and self.hold_ctr %30 == 0:
+            self.post_order = True
+        self.hold_ctr = min(self.hold_ctr, D)
+        if self.post_order:
+            r, spread = self.calc_res_price(ticker["mid"], pos, self.volatility, MAX_POS) # essentially these are the same. Changed from the 2-asset version.
+            logger.info ('Real mid: {}'.format (r))
+            logger.info ('Spread: {}'.format(spread))
+            buy_qty, sell_qty = self.get_qty(pos, self.volatility)
 
             if buy_qty != 0 or sell_qty != 0:
-                self.place_orders(other_spread, other_r, spread, r, ticker["mid"], buy_qty, sell_qty, pos)
-                self.act_volatility = self.cur_volatility
-                self.cur_len += bool(buy_qty) + bool(sell_qty)
-                logger.info('Orders post: {}, {}, {}, {}'.format(r, spread, buy_qty, sell_qty))
+                self.place_orders(spread, r, ticker["mid"], buy_qty, sell_qty, pos)
+                logger.debug('Orders post: {}, {}, {}, {}'.format(r, spread, buy_qty, sell_qty))
+            else:
+                if buy_qty == 0 and len(buy_ords) != 0:
+                    for i in buy_ords:
+                        self.exchange.cancel_order(i)
+                if sell_qty == 0 and len(sell_ords) != 0:
+                    for i in sell_ords:
+                        self.exchange.cancel_order(i)
+            self.post_order = False
         else:
-            pass
+            pass  # since before latest patch.
 
-        self.prev_len = self.cur_len
+        self.prev_volatility = self.volatility
         self.prev_qty = self.cur_qty
-
+        logger.info("==="*10)
+        print ("Elapsed Time: {}".format(time.time() - start))
     def round_to(self, n, precision):
         correction = 0.5 if n >= 0 else -0.5
         return int( n/precision+correction ) * precision
@@ -624,60 +502,49 @@ class OrderManager:
         i, p, d = s.partition('.')
         return float('.'.join([i, (d+'0'*n)[:n]]))
 
-    def place_orders(self, other_spread, other_mid, spread, mid, exchange_mid, buy_qty, sell_qty, pos):
+    def place_orders(self, spread, mid, exchange_mid, buy_qty, sell_qty, pos):
+        
         """Create order items for use in convergence."""
 
         buy_orders = []
         sell_orders = []
-        # Create orders from the outside in. This is intentional - let's say the inner order gets taken;
-        # then we match orders from the outside in, ensuring the fewest number of orders are amended and only
-        # a new order is created in the inside. If we did it inside-out, all orders would be amended
-        # down and a new order would be created at the outside.
 
         getcontext().prec = 4
-        # if pos > 0: # change so that we always send POSTONLY orders
-        #     buy = {'orderQty': buy_qty, 'price': self.round_to_05(float(Decimal(mid) - Decimal(spread)/Decimal(2))), 'side': 'Buy', 'execInst': 'ParticipateDoNotInitiate'}
-        #     sell = {'orderQty': sell_qty, 'price': self.round_to_05(float(Decimal(mid) + Decimal(spread)/Decimal(2))), 'side': 'Sell', 'execInst': 'ParticipateDoNotInitiate'}
-        # elif pos < 0:
-        #     buy = {'orderQty': buy_qty, 'price': self.round_to_05(float(Decimal(mid) - Decimal(spread)/Decimal(2))), 'side': 'Buy', 'execInst': 'ParticipateDoNotInitiate'}
-        #     sell = {'orderQty': sell_qty, 'price': self.round_to_05(float(Decimal(mid) + Decimal(spread)/Decimal(2))), 'side': 'Sell', 'execInst': 'ParticipateDoNotInitiate'}
-        buy_price = max(self.round_to_05(float(Decimal(mid) - Decimal(spread)/Decimal(2))), self.round_to_05(float(Decimal(other_mid) - Decimal(other_spread)/Decimal(2))))
-        sell_price = min(self.round_to_05(float(Decimal(mid) + Decimal(spread)/Decimal(2))), self.round_to_05(float(Decimal(other_mid) + Decimal(other_spread)/Decimal(2))))
+        buy_price = self.round_to_05(float(Decimal(mid) - Decimal(spread)/Decimal(2)))
+        sell_price = self.round_to_05(float(Decimal(mid) + Decimal(spread)/Decimal(2))) #min(, self.round_to_05(float(Decimal(other_mid) + Decimal(other_spread)/Decimal(2))))
 
-        print('Before adjustments: Buy: {}; Sell: {}; Mid: {}'.format(buy_price,sell_price, float(Decimal(exchange_mid))))
-
+          
         if self.exchange.symbol == 'ETHUSD':
             if self.truncate(buy_price, 2) >= exchange_mid:
-                logger.info('Buy -- Revise Price for POSTONLY')
+                logger.debug('Buy -- Revise Price for POSTONLY')
                 buy_price = float(exchange_mid - 0.05)
             if self.truncate(sell_price, 2) <= exchange_mid:
-                logger.info('Sell -- Revise Price for POSTONLY')
+                logger.debug('Sell -- Revise Price for POSTONLY')
                 sell_price = float(exchange_mid + 0.05)
 
         if self.exchange.symbol == 'XBTUSD':
             if self.truncate(buy_price, 2) >= exchange_mid:
-                logger.info('Buy -- Revise Price for POSTONLY')
+                logger.debug('Buy -- Revise Price for POSTONLY')
                 buy_price = float(exchange_mid - 0.5)
             if self.truncate(sell_price, 2) <= exchange_mid:
-                logger.info('Sell -- Revise Price for POSTONLY')
+                logger.debug('Sell -- Revise Price for POSTONLY')
                 sell_price = float(exchange_mid + 0.5)
 
 
-        print('After adjustments: Buy: {}; Sell: {}; Mid: {}'.format(buy_price,sell_price, float(Decimal(exchange_mid))))
+        logger.debug ('After adjustments: Buy: {}; Sell: {}; Mid: {}'.format(buy_price,sell_price, float(Decimal(exchange_mid))))
 
-
-        if self.cur_of > 0:
-            sell_price = self.round_to_05(sell_price + self.adjust_order_imbalance(self.cur_of))
-        else:
-            buy_price = self.round_to_05(buy_price + self.adjust_order_imbalance(self.cur_of))
 
         if self.exchange.symbol == "XBTUSD":
             buy = {'orderQty': buy_qty, 'price': self.round_to(buy_price, 0.5), 'side': 'Buy', 'execInst': 'ParticipateDoNotInitiate'}
             sell = {'orderQty': sell_qty, 'price': self.round_to(sell_price, 0.5), 'side': 'Sell', 'execInst': 'ParticipateDoNotInitiate'}
 
         elif self.exchange.symbol == "ETHUSD":
-            buy = {'orderQty': buy_qty, 'price': buy_price, 'side': 'Buy', 'execInst': 'ParticipateDoNotInitiate'}
-            sell = {'orderQty': sell_qty, 'price': sell_price, 'side': 'Sell', 'execInst': 'ParticipateDoNotInitiate'}
+            buy = {'orderQty': buy_qty, 'price': self.round_to_05(buy_price), 'side': 'Buy', 'execInst': 'ParticipateDoNotInitiate'}
+            sell = {'orderQty': sell_qty, 'price': self.round_to_05(sell_price), 'side': 'Sell', 'execInst': 'ParticipateDoNotInitiate'}
+            if self.brb == 2 and pos > 0 and self.wypnl_green == False:
+                sell = {'orderQty': sell_qty, 'price': self.round_to_05(sell_price), 'side': 'Sell'}
+            if self.brb == 2 and pos < 0 and self.wypnl_green == False:
+                buy = {'orderQty': buy_qty, 'price': self.round_to_05(buy_price), 'side': 'Buy'}
 
         if buy_qty == 0:
             sell_orders.append(sell)
@@ -686,11 +553,10 @@ class OrderManager:
         else:
             sell_orders.append(sell)
             buy_orders.append(buy)
-        print ('Buy: {}; Sell: {}'.format(buy['price'], sell['price']))
-        logger.info('Buy: {}; Sell: {}'.format(buy['price'], sell['price']))
+        #print ('Buy: {}; Sell: {}'.format(buy['price'], sell['price']))
+        #print (buy_orders, sell_orders)
+        logger.info('Orders posted -- Buy: {}; Sell: {}'.format(buy_orders, sell_orders))
 
-        self.of = self.cur_of
-        os.system("""say 'Please be alerted. New orders posted to bitmex.' """)
         return self.converge_orders(buy_orders, sell_orders, spread, mid, exchange_mid, buy_qty, sell_qty, pos)
 
     def converge_orders(self, buy_orders, sell_orders, spread, mid, exchange_mid, buy_qty, sell_qty, pos):
@@ -751,7 +617,8 @@ class OrderManager:
         if len(to_amend) > 0:
             for amended_order in reversed(to_amend):
                 reference_order = [o for o in existing_orders if o['orderID'] == amended_order['orderID']][0]
-                logger.info("Amending %4s: %d @ %.*f to %d @ %.*f (%+.*f)" % (
+                logger.info("  Amending %s %4s: %d @ %.*f to %d @ %.*f (%+.*f)" % (
+                    amended_order['orderID'],
                     amended_order['side'],
                     reference_order['leavesQty'], tickLog, reference_order['price'],
                     (amended_order['orderQty'] - reference_order['cumQty']), tickLog, amended_order['price'],
@@ -767,8 +634,7 @@ class OrderManager:
                 errorObj = e.response.json()
                 if errorObj['error']['message'] == 'Invalid ordStatus':
                     logger.warn("Amending failed. Waiting for order data to converge and retrying.")
-                    sleep(5)
-                    return self.place_orders(spread, mid, exchange_mid, buy_qty, sell_qty, pos)
+                    #return self.place_orders(spread, mid, exchange_mid, buy_qty, sell_qty, pos)
                 else:
                     logger.error("Unknown error on amend: %s. Exiting" % errorObj)
                     sys.exit(1)
@@ -776,16 +642,16 @@ class OrderManager:
         if len(to_create) > 0:
             logger.info("Creating %d orders:" % (len(to_create)))
             for order in reversed(to_create):
-                logger.info("%4s %d @ %.*f" % (order['side'], order['orderQty'], tickLog, order['price']))
+                logger.info("  Creating %4s %d @ %.*f" % (order['side'], order['orderQty'], tickLog, order['price']))
             self.exchange.create_bulk_orders(to_create)
 
         # Could happen if we exceed a delta limit
         if len(to_cancel) > 0:
             logger.info("Canceling %d orders:" % (len(to_cancel)))
-            for order in reversed(to_cancel):
-                logger.info("%4s %d @ %.*f" % (order['side'], order['leavesQty'], tickLog, order['price']))
+            for order in reversed(list(to_cancel)):
+                logger.info("  Canceling %s %4s %d @ %.*f" % (order['orderID'], order['side'], order['leavesQty'], tickLog, order['price']))
             self.exchange.cancel_bulk_orders(to_cancel)
-
+        
     def sanity_check(self):
         """Perform checks before placing orders."""
 
@@ -816,34 +682,35 @@ class OrderManager:
         except Exception as e:
             logger.info("Unable to cancel orders: %s" % e)
 
-        print ('Dropping database.')
-        self.client.drop_database('example')
+        #print ('Dropping database.')
+        #self.client.drop_database('example')
         print('Final Scripts Completed')
         os._exit(1) # Ends the script without raising exception
         # sys.exit()
 
     def run_loop(self):
-        threading.Timer(5.0, self.run_loop).start()
+        threading.Timer(1.0, self.run_loop).start()
         sys.stdout.write("-----\n")
         sys.stdout.flush()
 
         self.ctr += 1
 
+        logger.info('File check')
         self.check_file_change()
+        logger.info('File check completed.')
         #sleep(settings.LOOP_INTERVAL)
 
             # This will restart on very short downtime, but if it's longer,
             # the MM will crash entirely as it is unable to connect to the WS on boot.
         if not self.check_connection():
-            logger.error("Realtime data connection unexpectedly closed, restarting.")
+            logger.info("Realtime data connection unexpectedly closed, restarting.")
             self.add_to_influx('connection', float(0))
             self.exit()
-            #self.restart()
         elif self.check_connection():
             self.add_to_influx('connection', float(1))
 
         self.sanity_check()  # Ensures health of mm - several cut-out points here
-        self.print_status()  # Print skew, delta, etc
+        #self.print_status()  # Print skew, delta, etc
 
         self.one_loop()  # Creates desired orders and converges to existing orders
 
@@ -859,6 +726,7 @@ def XBt_to_XBT(XBt):
 # todo: helper function: convert bitmex symbol to ccxt symbol
 def run():
     logger.info('BitMEX Market Maker Version: %s\n' % constants.VERSION)
+    logger.info('Run starts at: {}'.format(datetime.datetime.now()))
 
     om = OrderManager()
     #print("print attributes: ", om.__dict__)
