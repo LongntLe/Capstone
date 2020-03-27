@@ -4,10 +4,10 @@ import cvxpy as cvx
 from sklearn.linear_model import LinearRegression
 import time
 
-w = 60 # parameter for calibrating period. I.e., the bot look into the data 15 data points before the current point to project market moving in the next window.
+w = 15 # parameter for calibrating period. I.e., the bot look into the data 15 data points before the current point to project market moving in the next window.
 N = w
-s = ob_df.ms.tolist()[:200]# load data into list
-act_s = ob_df.ms.tolist()[1:201] # data moves up 1 step to account for latency.
+s = ob_df.ms.tolist()[:1000]# load data into list
+act_s = ob_df.ms.tolist()[1:1001] # data moves up 1 step to account for latency.
 ds = np.array(act_s[1:]) - np.array(act_s[:-1])
 
 # fit trend line on moving window
@@ -28,30 +28,27 @@ for i in range(w, len(s)):
     projs = []
     projsog = []
     for i in range(50):
-        nxt_inc = np.random.normal(loc=np.mean(ds_t), scale=np.std(ds_t)/50, size=w+1)
+        nxt_inc = np.random.normal(loc=np.mean(ds_t), scale=np.std(ds_t), size=w+1)
         proj_s = nxt_inc + np.array([model.coef_[0]*i + model.intercept_ for i in range(w, 2*w+1)])
         proj_s_org = proj_s
         if len(projsog) >= 1:
             projsog = np.vstack ((projsog, proj_s_org[1:]))
         else:
             projsog = proj_s_org[1:]
-        #print (len(projsog), len(np.zeros(N)))
+        # we add a row of 0s every other row so that the dimension of our data has 2*K row. This is so that we can do matmul with X.
         projsog = np.vstack((projsog, np.zeros(N)))
-        #proj_s_org = proj_s_org.T
         proj_s = proj_s[1:] - proj_s[:-1]
         if len(projs) >= 1:
             projs = np.vstack((projs, proj_s))
         else:
             projs = proj_s
         projs = np.vstack((projs, np.zeros(N)))
-        #proj_s = proj_s.T
     projs = np.matrix(projs)
     projsog = np.matrix(projsog)
     projs = projs.T
     projsog = projsog.T
 
-        # solve optimization problem on a window of time T=15
-    #print (sum(ord_list))
+    # solve optimization problem on a window of time T=15
     """
     The code block below makes use of CVXPy to solve an optimization.
     """
@@ -59,7 +56,7 @@ for i in range(w, len(s)):
     N = w # size of moving window
     max_pos = 1 # max position size
 
-    # matrices A and B as shown in MPC model formulation
+    # matrices A and B as shown in MPC model formulation, to have the universal we need to stack the matrices A and B for all projected time series into one
     ctr = 0
     A = []
     for i in range(2*50):
@@ -85,11 +82,10 @@ for i in range(w, len(s)):
     con.extend([X[:,1:w+1] == A*X[:,0:w] + B*U]) # constraint 2: update condition
     con.extend([cvx.norm(U[0,j],'inf')<=max_pos for j in range(0,N)]) # constraint 3: maximum trading position
     con.extend([cvx.norm(X[0,:],'inf')<=1]) # constraint 4: maximum inventory size
-    #con.extend([cvx.min(U[j])>=0.001 for j in range(0,2*50,2)])
-    #con.extend([cvx.abs(cvx.max(U))>=2e-10])
 
     con.extend([X[j, -1] == 0 for j in range(0,2*50,2)]) #neutral exposure
-
+    
+    # create a matrix to be fed into objective function -- this is the second term in the objective function
     for i in range(2*50):
         if i == 0:
             tv_arr = cvx.tv(cvx.multiply(np.array(projsog[:,i].T)[0],X[i,1:w+1]))
@@ -109,20 +105,19 @@ for i in range(w, len(s)):
     
 ord_list = ord_list[1:] # discard the first (zero place-holder) action
 
-# # plot result (inventory over time)
-# plt.plot(list(range(14, 30)), X.value[0])
 
-# plot the pnl of the bot
 ord_list = [0]*w + ord_list
 pnl = np.cumsum(np.cumsum(np.array(ord_list[:-1]))*ds)
+
+# plot the pnl of the bot
+fig = plt.figure(figsize=(15,5))
+plt.subplot(1,3,1)
 plt.plot(pnl)
 
 # plot inventory over time
+plt.subplot(1,3,2)
 plt.plot(np.cumsum(ord_list))
 
 # plot price time series
+plt.subplot(1,3,3)
 plt.plot(act_s)
-
-ord_list_1 = [0.015*np.sign(item) for item in ord_list]
-pnl = np.cumsum(np.cumsum(np.array(ord_list_1[:-1]))*ds)
-plt.plot(pnl)
