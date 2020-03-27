@@ -2,11 +2,10 @@ import logging
 from os.path import join
 
 LOG_LEVEL = logging.INFO
-# The BitMEX API requires permanent API keys. Go to https://testnet.bitmex.com/app/apiKeys to fill these out.
 
 # The BitMEX API requires permanent API keys. Go to https://testnet.bitmex.com/app/apiKeys to fill these out.
-API_KEY = "EFFZOvOW_WJq00T-fyqXSODU" #"-9NdCmNitAGUaCAXVYoFIbdv" #  #"vI_PDNYSFP7d_jsClDUfW6EF" #"9FR7reF9F71NDZG_BDoMsfm9" #"ZJ7ZG0bDrem884wQkNnvv2PB"
-API_SECRET = "Y0HgsMr3YRvSxtaNYvRAbEL0ofp-aARxwg6Au7cXto6qTZtV"
+API_KEY = ""
+API_SECRET = ""
 
 class settingsETHUSD:
     # For running ETH to USD
@@ -14,8 +13,8 @@ class settingsETHUSD:
     BASE_URL = "https://www.bitmex.com/api/v1/" # Once you're ready, uncomment this.
 
     # The BitMEX API requires permanent API keys. Go to https://testnet.bitmex.com/app/apiKeys to fill these out.
-    API_KEY = "EFFZOvOW_WJq00T-fyqXSODU" #"-9NdCmNitAGUaCAXVYoFIbdv" #  #"vI_PDNYSFP7d_jsClDUfW6EF" #"9FR7reF9F71NDZG_BDoMsfm9" #"ZJ7ZG0bDrem884wQkNnvv2PB"
-    API_SECRET = "Y0HgsMr3YRvSxtaNYvRAbEL0ofp-aARxwg6Au7cXto6qTZtV"
+    API_KEY = ""
+    API_SECRET = ""
 
     SYMBOL = 'ETHUSD'
 
@@ -114,8 +113,8 @@ class settingsXBTUSD:
     BASE_URL = "https://www.bitmex.com/api/v1/" # Once you're ready, uncomment this.
 
     # The BitMEX API requires permanent API keys. Go to https://testnet.bitmex.com/app/apiKeys to fill these out.
-    API_KEY = "EFFZOvOW_WJq00T-fyqXSODU" #"-9NdCmNitAGUaCAXVYoFIbdv" #  #"vI_PDNYSFP7d_jsClDUfW6EF" #"9FR7reF9F71NDZG_BDoMsfm9" #"ZJ7ZG0bDrem884wQkNnvv2PB"
-    API_SECRET = "Y0HgsMr3YRvSxtaNYvRAbEL0ofp-aARxwg6Au7cXto6qTZtV"
+    API_KEY = ""
+    API_SECRET = ""
 
     SYMBOL = 'XBTUSD'
 
